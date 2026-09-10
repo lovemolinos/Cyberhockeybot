@@ -227,10 +227,9 @@ def parse_block(text, default_league="Общая", default_date=None):
         if not m:
             continue
 
-_KEY        t1 = m.group(1 не).strip()
-        t зада2 = m.group(2).stripн()
-        s1, s2")
- = int(m.group(3)), int(m       .group(4))
+        t1 = m.group(1).strip()
+        t2 = m.group(2).strip()
+        s1, s2 = int(m.group(3)), int(m.group(4))
         periods = None
         if m.group(5):
             pairs = re.findall(r'(\d+)\s*[:]\s*(\d+)', m.group(5))
@@ -270,7 +269,8 @@ def prepare_image(image_bytes, max_size=1600):
 # ---------- OCR ----------
 async def ocr_image(image_bytes):
     if not OCR_API_KEY:
-        log.error("OCR_API return None
+        log.error("OCR_API_KEY не задан")
+        return None
     try:
         log.info(f"OCR: отправляю {len(image_bytes)} байт")
         async with ClientSession() as s:
