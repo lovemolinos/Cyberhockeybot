@@ -41,47 +41,98 @@ def over_prob(lam, threshold):
 
 
 # ---------- DATABASE ----------
+async def create_pool_with_retry(max_attempts=100, delay=10):
+    """Создаёт пул. Пробует много раз с паузами, не падает."""
+    global pool
+    if not DATABASE_URL:
+        log.error("=== DATABASE_URL not set! ===")
+        return None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=5,
+                timeout=60,
+                command_timeout=60,
+                statement_cache_size=0,
+                prepared_statement_cache_size=0
+            )
+            async with pool.acquire() as c:
+                await c.execute("SELECT 1")
+            log.info(f"=== DB CONNECTED (attempt {attempt}) ===")
+            return pool
+        except Exception as e:
+            log.error(f"=== DB INIT FAILED (try {attempt}): {e} ===")
+            pool = None
+            await asyncio.sleep(delay)
+    return None
+
+
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=1,
-        max_size=5,
-        timeout=30,
-        statement_cache_size=0,
-        prepared_statement_cache_size=0
-    )
-    async with pool.acquire() as c:
-        await c.execute("""
-            CREATE TABLE IF NOT EXISTS matches (
-                id SERIAL PRIMARY KEY,
-                match_date DATE,
-                league TEXT NOT NULL,
-                team1 TEXT NOT NULL,
-                team2 TEXT NOT NULL,
-                s1 INT NOT NULL,
-                s2 INT NOT NULL,
-                p1_1 INT, p1_2 INT,
-                p2_1 INT, p2_2 INT,
-                p3_1 INT, p3_2 INT,
-                total INT NOT NULL,
-                p1_total INT, p2_total INT, p3_total INT,
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            );
-            ALTER TABLE matches ADD COLUMN IF NOT EXISTS match_date DATE;
-            CREATE INDEX IF NOT EXISTS idx_league ON matches(league);
-            CREATE INDEX IF NOT EXISTS idx_team1 ON matches(team1);
-            CREATE INDEX IF NOT EXISTS idx_team2 ON matches(team2);
-            CREATE INDEX IF NOT EXISTS idx_match_date ON matches(match_date);
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-        """)
-    log.info("DB schema ready")
+    if pool is None:
+        await create_pool_with_retry(max_attempts=5, delay=5)
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as c:
+            await c.execute("""
+                CREATE TABLE IF NOT EXISTS matches (
+                    id SERIAL PRIMARY KEY,
+                    match_date DATE,
+                    league TEXT NOT NULL,
+                    team1 TEXT NOT NULL,
+                    team2 TEXT NOT NULL,
+                    s1 INT NOT NULL,
+                    s2 INT NOT NULL,
+                    p1_1 INT, p1_2 INT,
+                    p2_1 INT, p2_2 INT,
+                    p3_1 INT, p3_2 INT,
+                    total INT NOT NULL,
+                    p1_total INT, p2_total INT, p3_total INT,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                ALTER TABLE matches ADD COLUMN IF NOT EXISTS match_date DATE;
+                CREATE INDEX IF NOT EXISTS idx_league ON matches(league);
+                CREATE INDEX IF NOT EXISTS idx_team1 ON matches(team1);
+                CREATE INDEX IF NOT EXISTS idx_team2 ON matches(team2);
+                CREATE INDEX IF NOT EXISTS idx_match_date ON matches(match_date);
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+            """)
+        log.info("DB schema ready")
+        return True
+    except Exception as e:
+        log.error(f"DB schema error: {e}")
+        return False
+
+
+async def ensure_pool():
+    """Проверяет, что пул жив. Если нет — пытается переподключиться."""
+    global pool
+    if pool is not None:
+        try:
+            async with pool.acquire() as c:
+                await c.execute("SELECT 1")
+            return True
+        except Exception as e:
+            log.warning(f"Pool broken: {e}. Reconnecting...")
+            try:
+                await pool.close()
+            except Exception:
+                pass
+            pool = None
+    # Переподключаемся
+    await create_pool_with_retry(max_attempts=3, delay=3)
+    return pool is not None
 
 
 async def insert_match(league, team1, team2, s1, s2, periods, match_date=None):
+    if not await ensure_pool():
+        raise RuntimeError("DB_UNAVAILABLE")
     p1 = periods[0] if periods and len(periods) > 0 else (None, None)
     p2 = periods[1] if periods and len(periods) > 1 else (None, None)
     p3 = periods[2] if periods and len(periods) > 2 else (None, None)
@@ -106,17 +157,22 @@ async def insert_match(league, team1, team2, s1, s2, periods, match_date=None):
 
 
 async def get_setting(key, default=None):
+    if not await ensure_pool():
+        return default
     async with pool.acquire() as c:
         r = await c.fetchrow("SELECT value FROM settings WHERE key=$1", key)
         return r["value"] if r else default
 
 
 async def set_setting(key, value):
+    if not await ensure_pool():
+        return False
     async with pool.acquire() as c:
         await c.execute("""
             INSERT INTO settings (key, value) VALUES ($1, $2)
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         """, key, str(value))
+    return True
 
 
 # ---------- PARSING ----------
@@ -138,7 +194,6 @@ def parse_block(text, default_league="Общая", default_date=None):
         if not line:
             continue
 
-        # "[2026-09-10] [Название лиги]"
         both = re.match(
             r'^\s*\[\s*(\d{4}[-.]\d{2}[-.]\d{2})\s*\]\s*'
             r'[\[\(]\s*(.+?)\s*[\]\)]\s*$',
@@ -153,7 +208,6 @@ def parse_block(text, default_league="Общая", default_date=None):
             league = both.group(2).strip()
             continue
 
-        # "[2026-09-10]" на отдельной строке
         dm = DATE_RE.match(line)
         if dm:
             try:
@@ -163,13 +217,11 @@ def parse_block(text, default_league="Общая", default_date=None):
                 pass
             continue
 
-        # "[Лига]"
         lb = LEAGUE_RE.match(line)
         if lb:
             league = lb.group(1).strip()
             continue
 
-        # "Лига: команда - команда счёт"
         prefix = re.match(r'^([^:\d]{2,40})\s*:\s*(.+)$', line)
         if prefix and SCORE_RE.match(prefix.group(2).strip()):
             league = prefix.group(1).strip()
@@ -241,23 +293,22 @@ async def ocr_image(image_bytes):
             ) as r:
                 log.info(f"OCR HTTP статус: {r.status}")
                 j = await r.json()
-                log.info(f"OCR ответ: {str(j)[:500]}")
         if j.get("IsErroredOnProcessing"):
             log.error(f"OCR ошибка: {j.get('ErrorMessage')}")
             return None
         results = j.get("ParsedResults")
         if not results:
             return None
-        text = results[0].get("ParsedText", "")
-        log.info(f"OCR распознал {len(text)} символов")
-        return text
+        return results[0].get("ParsedText", "")
     except Exception as e:
         log.error(f"OCR исключение: {e}", exc_info=True)
         return None
 
 
 # ---------- STATS ----------
-async def team_stats(team, league=None, date_from=None, date_to=None):
+async def team_stats(team, league=None):
+    if not await ensure_pool():
+        return None
     q = """SELECT COUNT(*) AS n,
         AVG(total)::float AS avg_total,
         AVG(p1_total)::float AS avg_p1,
@@ -265,19 +316,9 @@ async def team_stats(team, league=None, date_from=None, date_to=None):
         AVG(p3_total)::float AS avg_p3
         FROM matches WHERE (team1=$1 OR team2=$1)"""
     args = [team]
-    idx = 2
     if league:
-        q += f" AND league=${idx}"
+        q += " AND league=$2"
         args.append(league)
-        idx += 1
-    if date_from:
-        q += f" AND match_date >= ${idx}"
-        args.append(date_from)
-        idx += 1
-    if date_to:
-        q += f" AND match_date <= ${idx}"
-        args.append(date_to)
-        idx += 1
     async with pool.acquire() as c:
         r = await c.fetchrow(q, *args)
     if r and r["n"] and r["n"] > 0:
@@ -286,6 +327,8 @@ async def team_stats(team, league=None, date_from=None, date_to=None):
 
 
 async def league_stats(league):
+    if not await ensure_pool():
+        return None
     async with pool.acquire() as c:
         r = await c.fetchrow("""
             SELECT COUNT(*) AS n,
@@ -301,6 +344,8 @@ async def league_stats(league):
 
 
 async def list_leagues():
+    if not await ensure_pool():
+        return []
     async with pool.acquire() as c:
         rows = await c.fetch(
             "SELECT DISTINCT league FROM matches ORDER BY league"
@@ -309,6 +354,8 @@ async def list_leagues():
 
 
 async def teams_in_league(league):
+    if not await ensure_pool():
+        return []
     async with pool.acquire() as c:
         rows = await c.fetch("""
             SELECT DISTINCT team FROM (
@@ -321,6 +368,8 @@ async def teams_in_league(league):
 
 
 async def find_league(t1, t2):
+    if not await ensure_pool():
+        return None
     async with pool.acquire() as c:
         r = await c.fetchrow("""
             SELECT league FROM matches
@@ -381,12 +430,12 @@ async def predict(league, t1, t2, odds):
 async def cmd_start(m: Message):
     await m.answer(
         "🏒 *Cyber Hockey Bot*\n\n"
-        "📷 Отправь скриншот Фонбет — распознаю\n"
+        "📷 Отправь скриншот Фонбет\n"
         "📝 Или текст:\n"
         "`[2026-09-10] [Лига]`\n"
         "`Команда1 - Команда2 3:2 (1:1,1:0,1:1)`\n\n"
         "*Прогноз:* `/predict Лига: Т1 - Т2 1.85`\n"
-        "*Статистика:* /leagues /teams /stats /by_date\n"
+        "*Статистика:* /leagues /stats /by_date\n"
         "*Банк:* /bank 10000\n"
         "*Управление:* /delete_all",
         parse_mode="Markdown"
@@ -403,10 +452,28 @@ async def cmd_ping(m: Message):
     await m.answer("🏓 Pong! Бот живой.")
 
 
+@router.message(Command("db"))
+async def cmd_db(m: Message):
+    if pool is None:
+        await m.answer("❌ Пул не создан. Пробую переподключиться...")
+        ok = await ensure_pool()
+        await m.answer("✅ Переподключился." if ok else "❌ Не удалось.")
+        return
+    try:
+        async with pool.acquire() as c:
+            r = await c.fetchrow("SELECT COUNT(*) AS n FROM matches")
+        await m.answer(f"✅ БД работает. Матчей: {r['n']}")
+    except Exception as e:
+        await m.answer(f"❌ Ошибка: {e}")
+
+
 @router.message(Command("delete_all"))
 async def cmd_delete_all(m: Message):
     parts = m.text.split(maxsplit=1)
     if len(parts) == 2 and parts[1].strip().lower() == "yes":
+        if not await ensure_pool():
+            await m.answer("❌ БД недоступна, попробуй позже")
+            return
         async with pool.acquire() as c:
             await c.execute("DELETE FROM matches")
         delete_pending.pop(m.from_user.id, None)
@@ -414,7 +481,7 @@ async def cmd_delete_all(m: Message):
         return
     delete_pending[m.from_user.id] = True
     await m.answer(
-        "⚠️ *Ты уверен?* Это удалит ВСЕ матчи из базы.\n\n"
+        "⚠️ *Ты уверен?* Это удалит ВСЕ матчи.\n\n"
         "Напиши `/delete_all yes` для подтверждения.",
         parse_mode="Markdown"
     )
@@ -422,11 +489,14 @@ async def cmd_delete_all(m: Message):
 
 @router.message(Command("by_date"))
 async def cmd_by_date(m: Message):
+    if not await ensure_pool():
+        await m.answer("❌ БД недоступна")
+        return
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
         await m.answer(
             "Формат: `/by_date 2026-09-10`\n"
-            "или диапазон: `/by_date 2026-09-01 2026-09-10`",
+            "или: `/by_date 2026-09-01 2026-09-10`",
             parse_mode="Markdown"
         )
         return
@@ -479,17 +549,15 @@ async def cmd_leagues(m: Message):
 async def cmd_teams(m: Message):
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
-        await m.answer("Формат: /teams Москва")
+        await m.answer("Формат: /teams Лига")
         return
     teams = await teams_in_league(parts[1].strip())
     if not teams:
         await m.answer("Лига не найдена или пуста")
         return
     txt = "\n".join(f"• {t}" for t in teams)
-    await m.answer(
-        f"🏒 *{parts[1].strip()}*:\n{txt}",
-        parse_mode="Markdown"
-    )
+    await m.answer(f"🏒 *{parts[1].strip()}*:\n{txt}",
+                   parse_mode="Markdown")
 
 
 @router.message(Command("stats"))
@@ -527,8 +595,11 @@ async def cmd_bank(m: Message):
         return
     try:
         v = float(parts[1].replace(",", ".").replace(" ", ""))
-        await set_setting("bank", v)
-        await m.answer(f"✅ Банк установлен: {v:.0f} ₽")
+        ok = await set_setting("bank", v)
+        if ok:
+            await m.answer(f"✅ Банк установлен: {v:.0f} ₽")
+        else:
+            await m.answer("❌ БД недоступна")
     except ValueError:
         await m.answer("Введите число, например: /bank 5000")
 
@@ -611,10 +682,7 @@ async def any_message(m: Message):
         except AttributeError:
             data = bytes(buf.read())
 
-        log.info(f"Скачал фото: {len(data)} байт")
         data = prepare_image(data)
-        log.info(f"После сжатия: {len(data)} байт")
-
         text = await ocr_image(data)
         if not text:
             await m.answer("❌ OCR не смог распознать картинку.")
@@ -630,9 +698,18 @@ async def any_message(m: Message):
             )
             return
 
+        if not await ensure_pool():
+            await m.answer("❌ БД недоступна, попробуй через минуту")
+            return
+
+        saved = 0
         for mt in matches:
-            await insert_match(**mt)
-        await m.answer(f"✅ Добавлено {len(matches)} матчей.")
+            try:
+                await insert_match(**mt)
+                saved += 1
+            except Exception as e:
+                log.error(f"insert_match failed: {e}")
+        await m.answer(f"✅ Добавлено {saved}/{len(matches)} матчей.")
         return
 
     if m.text:
@@ -645,11 +722,22 @@ async def any_message(m: Message):
                 parse_mode="Markdown"
             )
             return
+
+        if not await ensure_pool():
+            await m.answer("❌ БД недоступна, попробуй через минуту")
+            return
+
+        saved = 0
         for mt in matches:
-            await insert_match(**mt)
+            try:
+                await insert_match(**mt)
+                saved += 1
+            except Exception as e:
+                log.error(f"insert_match failed: {e}")
+
         lg = set(x["league"] for x in matches)
         dates = set(str(x["match_date"]) for x in matches if x["match_date"])
-        txt = f"✅ Добавлено {len(matches)} матчей.\nЛиги: {', '.join(lg)}"
+        txt = f"✅ Добавлено {saved}/{len(matches)} матчей.\nЛиги: {', '.join(lg)}"
         if dates:
             txt += f"\nДаты: {', '.join(dates)}"
         await m.answer(txt)
@@ -675,17 +763,8 @@ async def start_web():
 async def main():
     await start_web()
 
-    if not DATABASE_URL:
-        log.error("=== DATABASE_URL not set! ===")
-    else:
-        for attempt in range(3):
-            try:
-                await init_db()
-                log.info("=== DB READY ===")
-                break
-            except Exception as e:
-                log.error(f"=== DB INIT FAILED (try {attempt+1}): {e} ===")
-                await asyncio.sleep(5)
+    # Ждём БД в фоне, не блокируем polling
+    asyncio.create_task(_db_bootstrap())
 
     if not BOT_TOKEN:
         log.error("=== BOT_TOKEN not set! ===")
@@ -705,6 +784,13 @@ async def main():
 
     log.info("=== BOT POLLING ===")
     await dp.start_polling(bot)
+
+
+async def _db_bootstrap():
+    """Фоновое подключение к БД. Не блокирует запуск бота."""
+    await create_pool_with_retry(max_attempts=100, delay=15)
+    if pool is not None:
+        await init_db()
 
 
 if __name__ == "__main__":
