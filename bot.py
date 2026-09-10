@@ -4,6 +4,7 @@ import math
 import io
 import asyncio
 import logging
+from datetime import date, datetime
 from aiohttp import web, ClientSession, FormData
 import asyncpg
 from aiogram import Bot, Dispatcher, Router
@@ -23,6 +24,7 @@ OCR_API_KEY = os.environ.get("OCR_API_KEY", "")
 
 router = Router()
 pool = None
+delete_pending = {}
 
 
 # ---------- POISSON ----------
@@ -42,12 +44,18 @@ def over_prob(lam, threshold):
 async def init_db():
     global pool
     pool = await asyncpg.create_pool(
-        DATABASE_URL, min_size=1, max_size=5, timeout=30
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        timeout=30,
+        statement_cache_size=0,
+        prepared_statement_cache_size=0
     )
     async with pool.acquire() as c:
         await c.execute("""
             CREATE TABLE IF NOT EXISTS matches (
                 id SERIAL PRIMARY KEY,
+                match_date DATE,
                 league TEXT NOT NULL,
                 team1 TEXT NOT NULL,
                 team2 TEXT NOT NULL,
@@ -60,9 +68,11 @@ async def init_db():
                 p1_total INT, p2_total INT, p3_total INT,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
+            ALTER TABLE matches ADD COLUMN IF NOT EXISTS match_date DATE;
             CREATE INDEX IF NOT EXISTS idx_league ON matches(league);
             CREATE INDEX IF NOT EXISTS idx_team1 ON matches(team1);
             CREATE INDEX IF NOT EXISTS idx_team2 ON matches(team2);
+            CREATE INDEX IF NOT EXISTS idx_match_date ON matches(match_date);
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -71,7 +81,7 @@ async def init_db():
     log.info("DB schema ready")
 
 
-async def insert_match(league, team1, team2, s1, s2, periods):
+async def insert_match(league, team1, team2, s1, s2, periods, match_date=None):
     p1 = periods[0] if periods and len(periods) > 0 else (None, None)
     p2 = periods[1] if periods and len(periods) > 1 else (None, None)
     p3 = periods[2] if periods and len(periods) > 2 else (None, None)
@@ -79,14 +89,18 @@ async def insert_match(league, team1, team2, s1, s2, periods):
     p1t = (p1[0] + p1[1]) if p1[0] is not None else None
     p2t = (p2[0] + p2[1]) if p2[0] is not None else None
     p3t = (p3[0] + p3[1]) if p3[0] is not None else None
+
+    if match_date is None:
+        match_date = date.today()
+
     async with pool.acquire() as c:
         await c.execute("""
             INSERT INTO matches (
-                league, team1, team2, s1, s2,
+                match_date, league, team1, team2, s1, s2,
                 p1_1, p1_2, p2_1, p2_2, p3_1, p3_2,
                 total, p1_total, p2_total, p3_total
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-        """, league, team1, team2, s1, s2,
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+        """, match_date, league, team1, team2, s1, s2,
             p1[0], p1[1], p2[0], p2[1], p3[0], p3[1],
             total, p1t, p2t, p3t)
 
@@ -111,26 +125,60 @@ SCORE_RE = re.compile(
     r'(?:\s*[\(\[]\s*([^\)\]]+?)\s*[\)\]])?\s*$'
 )
 LEAGUE_RE = re.compile(r'^\s*[\[\(\{]\s*(.+?)\s*[\]\)\}]\s*$')
+DATE_RE = re.compile(r'^\s*[\[\(]?\s*(\d{4}[-.]\d{2}[-.]\d{2})\s*[\]\)]?\s*$')
 
 
-def parse_block(text, default_league="Общая"):
+def parse_block(text, default_league="Общая", default_date=None):
     matches = []
     league = default_league
+    current_date = default_date
+
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
+
+        # "[2026-09-10] [Название лиги]"
+        both = re.match(
+            r'^\s*\[\s*(\d{4}[-.]\d{2}[-.]\d{2})\s*\]\s*'
+            r'[\[\(]\s*(.+?)\s*[\]\)]\s*$',
+            line
+        )
+        if both:
+            try:
+                ds = both.group(1).replace(".", "-")
+                current_date = datetime.strptime(ds, "%Y-%m-%d").date()
+            except Exception:
+                pass
+            league = both.group(2).strip()
+            continue
+
+        # "[2026-09-10]" на отдельной строке
+        dm = DATE_RE.match(line)
+        if dm:
+            try:
+                ds = dm.group(1).replace(".", "-")
+                current_date = datetime.strptime(ds, "%Y-%m-%d").date()
+            except Exception:
+                pass
+            continue
+
+        # "[Лига]"
         lb = LEAGUE_RE.match(line)
         if lb:
             league = lb.group(1).strip()
             continue
+
+        # "Лига: команда - команда счёт"
         prefix = re.match(r'^([^:\d]{2,40})\s*:\s*(.+)$', line)
         if prefix and SCORE_RE.match(prefix.group(2).strip()):
             league = prefix.group(1).strip()
             line = prefix.group(2).strip()
+
         m = SCORE_RE.match(line)
         if not m:
             continue
+
         t1 = m.group(1).strip()
         t2 = m.group(2).strip()
         s1, s2 = int(m.group(3)), int(m.group(4))
@@ -139,6 +187,7 @@ def parse_block(text, default_league="Общая"):
             pairs = re.findall(r'(\d+)\s*[:]\s*(\d+)', m.group(5))
             if len(pairs) >= 3:
                 periods = [(int(a), int(b)) for a, b in pairs[:3]]
+
         matches.append({
             "league": league,
             "team1": t1,
@@ -146,6 +195,7 @@ def parse_block(text, default_league="Общая"):
             "s1": s1,
             "s2": s2,
             "periods": periods,
+            "match_date": current_date,
         })
     return matches
 
@@ -207,7 +257,7 @@ async def ocr_image(image_bytes):
 
 
 # ---------- STATS ----------
-async def team_stats(team, league=None):
+async def team_stats(team, league=None, date_from=None, date_to=None):
     q = """SELECT COUNT(*) AS n,
         AVG(total)::float AS avg_total,
         AVG(p1_total)::float AS avg_p1,
@@ -215,9 +265,19 @@ async def team_stats(team, league=None):
         AVG(p3_total)::float AS avg_p3
         FROM matches WHERE (team1=$1 OR team2=$1)"""
     args = [team]
+    idx = 2
     if league:
-        q += " AND league=$2"
+        q += f" AND league=${idx}"
         args.append(league)
+        idx += 1
+    if date_from:
+        q += f" AND match_date >= ${idx}"
+        args.append(date_from)
+        idx += 1
+    if date_to:
+        q += f" AND match_date <= ${idx}"
+        args.append(date_to)
+        idx += 1
     async with pool.acquire() as c:
         r = await c.fetchrow(q, *args)
     if r and r["n"] and r["n"] > 0:
@@ -321,15 +381,14 @@ async def predict(league, t1, t2, odds):
 async def cmd_start(m: Message):
     await m.answer(
         "🏒 *Cyber Hockey Bot*\n\n"
-        "📷 Отправь скриншот Фонбет — распознаю результаты\n"
-        "📝 Или текст с матчами\n\n"
-        "*Формат текста:*\n"
-        "`[Москва]`\n"
-        "`Динамо - Спартак 3:2 (1:1,1:0,1:1)`\n"
-        "`ЦСКА - Локомотив 4:5 (2:2,1:1,1:2)`\n\n"
-        "*Прогноз:*\n"
-        "`/predict Москва: Динамо - Спартак 1.85`\n\n"
-        "*Другое:* /leagues /teams /stats /bank /test_fonbet",
+        "📷 Отправь скриншот Фонбет — распознаю\n"
+        "📝 Или текст:\n"
+        "`[2026-09-10] [Лига]`\n"
+        "`Команда1 - Команда2 3:2 (1:1,1:0,1:1)`\n\n"
+        "*Прогноз:* `/predict Лига: Т1 - Т2 1.85`\n"
+        "*Статистика:* /leagues /teams /stats /by_date\n"
+        "*Банк:* /bank 10000\n"
+        "*Управление:* /delete_all",
         parse_mode="Markdown"
     )
 
@@ -344,103 +403,73 @@ async def cmd_ping(m: Message):
     await m.answer("🏓 Pong! Бот живой.")
 
 
-@router.message(Command("test_fonbet"))
-async def cmd_test_fonbet(m: Message):
-    await m.answer("🔍 Проверяю Fonbet API...")
+@router.message(Command("delete_all"))
+async def cmd_delete_all(m: Message):
+    parts = m.text.split(maxsplit=1)
+    if len(parts) == 2 and parts[1].strip().lower() == "yes":
+        async with pool.acquire() as c:
+            await c.execute("DELETE FROM matches")
+        delete_pending.pop(m.from_user.id, None)
+        await m.answer("🗑 Все матчи удалены.")
+        return
+    delete_pending[m.from_user.id] = True
+    await m.answer(
+        "⚠️ *Ты уверен?* Это удалит ВСЕ матчи из базы.\n\n"
+        "Напиши `/delete_all yes` для подтверждения.",
+        parse_mode="Markdown"
+    )
+
+
+@router.message(Command("by_date"))
+async def cmd_by_date(m: Message):
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer(
+            "Формат: `/by_date 2026-09-10`\n"
+            "или диапазон: `/by_date 2026-09-01 2026-09-10`",
+            parse_mode="Markdown"
+        )
+        return
+    args = parts[1].split()
     try:
-        async with ClientSession() as s:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/120.0 Safari/537.36",
-                "Accept": "*/*",
-                "Referer": "https://www.fon.bet/",
-            }
-
-            r0 = await s.get("https://www.fon.bet/", headers=headers, timeout=15)
-            html = await r0.text()
-            log.info(f"Fonbet main: status={r0.status}, len={len(html)}")
-
-            api_domain = None
-            for candidate in ["line01", "line31", "line52", "line53", "line54"]:
-                if f"{candidate}.bkfon-resources.com" in html:
-                    api_domain = f"{candidate}.bkfon-resources.com"
-                    break
-            if not api_domain:
-                api_domain = "line52.bkfon-resources.com"
-
-            log.info(f"Fonbet API domain: {api_domain}")
-
-            url = (
-                f"https://{api_domain}/events/list"
-                f"?lang=ru&version=7175598316&scopeMarket=1600"
-            )
-            r1 = await s.get(url, headers=headers, timeout=20)
-            log.info(f"Fonbet API status: {r1.status}")
-
-            text_preview = (await r1.text())[:500]
-            log.info(f"Fonbet API preview: {text_preview}")
-
-            if r1.status != 200:
-                await m.answer(
-                    f"❌ Fonbet API статус: {r1.status}\n\n"
-                    f"Превью:\n`{text_preview}`",
-                    parse_mode="Markdown"
-                )
-                return
-
-            try:
-                data = await r1.json()
-            except Exception as e:
-                await m.answer(
-                    f"❌ Ответ не JSON: {e}\n\n"
-                    f"Превью:\n`{text_preview}`",
-                    parse_mode="Markdown"
-                )
-                return
-
-            events = data.get("events", []) or []
-            sports = data.get("sports", []) or []
-
-            cyber_events = []
-            for e in events:
-                sid = str(e.get("sportId", ""))
-                if sid in ("2", "5", "29"):
-                    cyber_events.append(e)
-
-            report = (
-                f"✅ Fonbet API доступен!\n\n"
-                f"🌐 Домен: `{api_domain}`\n"
-                f"📊 Всего событий: *{len(events)}*\n"
-                f"🎮 Киберспорт: *{len(cyber_events)}*\n"
-                f"🏆 Видов спорта: *{len(sports)}*\n\n"
-            )
-
-            if cyber_events:
-                report += "*Первые 5 кибер-событий:*\n"
-                for e in cyber_events[:5]:
-                    t1 = e.get("team1", "?")
-                    t2 = e.get("team2", "?")
-                    report += f"• {t1} vs {t2}\n"
-            else:
-                report += (
-                    "Киберспорт не найден по sportId.\n"
-                    "Пришли JSON preview."
-                )
-                report += f"\n\nJSON preview:\n`{str(data)[:1200]}`"
-
-            await m.answer(report, parse_mode="Markdown")
-
-    except Exception as e:
-        log.error(f"test_fonbet error: {e}", exc_info=True)
-        await m.answer(f"❌ Ошибка: `{e}`", parse_mode="Markdown")
+        d_from = datetime.strptime(args[0].replace(".", "-"), "%Y-%m-%d").date()
+        d_to = (
+            datetime.strptime(args[1].replace(".", "-"), "%Y-%m-%d").date()
+            if len(args) > 1 else d_from
+        )
+    except Exception:
+        await m.answer("Не понял дату. Формат: `2026-09-10`",
+                       parse_mode="Markdown")
+        return
+    async with pool.acquire() as c:
+        r = await c.fetchrow("""
+            SELECT COUNT(*) AS n,
+                AVG(total)::float AS avg_total,
+                AVG(p1_total)::float AS avg_p1,
+                AVG(p2_total)::float AS avg_p2,
+                AVG(p3_total)::float AS avg_p3
+            FROM matches
+            WHERE match_date BETWEEN $1 AND $2
+        """, d_from, d_to)
+    if not r or not r["n"]:
+        await m.answer("За этот период нет матчей.")
+        return
+    await m.answer(
+        f"📅 *{d_from} — {d_to}*\n"
+        f"Матчей: {r['n']}\n"
+        f"Ср. тотал: {(r['avg_total'] or 0):.2f}\n"
+        f"Ср. P1: {(r['avg_p1'] or 0):.2f}\n"
+        f"Ср. P2: {(r['avg_p2'] or 0):.2f}\n"
+        f"Ср. P3: {(r['avg_p3'] or 0):.2f}",
+        parse_mode="Markdown"
+    )
 
 
 @router.message(Command("leagues"))
 async def cmd_leagues(m: Message):
     ls = await list_leagues()
     if not ls:
-        await m.answer("Пока нет данных. Отправь скриншот или текст.")
+        await m.answer("Пока нет данных.")
         return
     lines = [f"• {x}" for x in ls]
     await m.answer("🏙 *Лиги:*\n" + "\n".join(lines), parse_mode="Markdown")
@@ -467,7 +496,7 @@ async def cmd_teams(m: Message):
 async def cmd_stats(m: Message):
     parts = m.text.split(maxsplit=2)
     if len(parts) < 2:
-        await m.answer("Формат: /stats Динамо [Москва]")
+        await m.answer("Формат: /stats Команда [Лига]")
         return
     team = parts[1].strip()
     league = parts[2].strip() if len(parts) > 2 else None
@@ -508,7 +537,7 @@ async def cmd_bank(m: Message):
 async def cmd_predict(m: Message):
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
-        await m.answer("Формат: /predict Москва: Динамо - Спартак 1.85")
+        await m.answer("Формат: /predict Лига: Т1 - Т2 1.85")
         return
     arg = parts[1].strip()
     league = None
@@ -526,7 +555,7 @@ async def cmd_predict(m: Message):
             pass
     tm = re.split(r'\s+[-–—]\s+', arg, maxsplit=1)
     if len(tm) != 2:
-        await m.answer("Формат: /predict Москва: Динамо - Спартак 1.85")
+        await m.answer("Формат: /predict Лига: Т1 - Т2 1.85")
         return
     t1, t2 = tm[0].strip(), tm[1].strip()
     if not league:
@@ -534,12 +563,12 @@ async def cmd_predict(m: Message):
     if not league:
         await m.answer(
             "Не нашёл лигу. Укажите вручную:\n"
-            "/predict Москва: Команда1 - Команда2 1.85"
+            "/predict Лига: Команда1 - Команда2 1.85"
         )
         return
     p = await predict(league, t1, t2, odds)
     if not p:
-        await m.answer("Недостаточно данных по одной из команд.")
+        await m.answer("Недостаточно данных.")
         return
     lines = [
         f"🏒 *{t1} vs {t2}* ({league})",
@@ -562,8 +591,8 @@ async def cmd_predict(m: Message):
         stake = max(0, kelly * 0.25 * bank)
         lines += [
             f"✅ *VALUE BET:* {p['best_name']}",
-            f"💵 Ставка: *{stake:.0f} ₽* (банк {bank:.0f})",
-            f"📈 Value: {p['value']*100:+.1f}% при коэф. {odds}",
+            f"💵 Ставка: *{stake:.0f} ₽*",
+            f"📈 Value: {p['value']*100:+.1f}%",
         ]
     else:
         lines.append(f"❌ Value = {p['value']*100:+.1f}%. Пропуск.")
@@ -595,8 +624,8 @@ async def any_message(m: Message):
         if not matches:
             preview = text[:1500]
             await m.answer(
-                "⚠️ OCR распознал текст, но я не нашёл в нём матчей.\n\n"
-                f"Вот что увидел OCR:\n\n`{preview}`",
+                "⚠️ OCR распознал текст, но я не нашёл матчей.\n\n"
+                f"`{preview}`",
                 parse_mode="Markdown"
             )
             return
@@ -610,19 +639,20 @@ async def any_message(m: Message):
         matches = parse_block(m.text)
         if not matches:
             await m.answer(
-                "🤔 Не понял. Отправь скриншот или текст:\n"
-                "`[Москва]`\n"
-                "`Динамо - Спартак 3:2 (1:1,1:0,1:1)`",
+                "🤔 Не понял. Формат:\n"
+                "`[2026-09-10] [Лига]`\n"
+                "`Команда1 - Команда2 3:2 (1:1,1:0,1:1)`",
                 parse_mode="Markdown"
             )
             return
         for mt in matches:
             await insert_match(**mt)
         lg = set(x["league"] for x in matches)
-        await m.answer(
-            f"✅ Добавлено {len(matches)} матчей.\n"
-            f"Лиги: {', '.join(lg)}"
-        )
+        dates = set(str(x["match_date"]) for x in matches if x["match_date"])
+        txt = f"✅ Добавлено {len(matches)} матчей.\nЛиги: {', '.join(lg)}"
+        if dates:
+            txt += f"\nДаты: {', '.join(dates)}"
+        await m.answer(txt)
 
 
 # ---------- WEB ----------
