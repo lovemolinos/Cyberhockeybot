@@ -62,4 +62,4 @@ async def init_db():
 async def insert_match(league, team1, team2, s1, s2, periods):
     p1 = periods[0] if periods and len(periods) > 0 else (None, None)
     p2 = periods[1] if periods and len(periods) > 1 else (None, None)
-    p3 = periods[2] if periods and len(periods) > 2 else 
+    p3 = periods[2] if periods and len(periods) > 2 else (None, None)
