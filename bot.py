@@ -1,6 +1,7 @@
 import os
 import re
 import math
+import io
 import asyncio
 import logging
 from aiohttp import web, ClientSession, FormData
@@ -8,6 +9,7 @@ import asyncpg
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.types import Message
+from PIL import Image
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,7 +25,7 @@ router = Router()
 pool = None
 
 
-# ---------- POISSON (pure python) ----------
+# ---------- POISSON ----------
 def poisson_pmf(k, lam):
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
@@ -122,7 +124,6 @@ def parse_block(text, default_league="Общая"):
         if lb:
             league = lb.group(1).strip()
             continue
-        # "Лига: Т1 - Т2 3:2"
         prefix = re.match(r'^([^:\d]{2,40})\s*:\s*(.+)$', line)
         if prefix and SCORE_RE.match(prefix.group(2).strip()):
             league = prefix.group(1).strip()
@@ -149,11 +150,32 @@ def parse_block(text, default_league="Общая"):
     return matches
 
 
+# ---------- IMAGE PREP ----------
+def prepare_image(image_bytes, max_size=1600):
+    """Сжимаем картинку, чтобы уложиться в лимит OCR.space (1 МБ)."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        w, h = img.size
+        if max(w, h) > max_size:
+            ratio = max_size / max(w, h)
+            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85, optimize=True)
+        return buf.getvalue()
+    except Exception as e:
+        log.error(f"prepare_image failed: {e}")
+        return image_bytes
+
+
 # ---------- OCR ----------
 async def ocr_image(image_bytes):
     if not OCR_API_KEY:
+        log.error("OCR_API_KEY не задан в переменных окружения!")
         return None
     try:
+        log.info(f"OCR: отправляю {len(image_bytes)} байт")
         async with ClientSession() as s:
             form = FormData()
             form.add_field(
@@ -164,20 +186,33 @@ async def ocr_image(image_bytes):
             form.add_field("language", "rus")
             form.add_field("isOverlayRequired", "false")
             form.add_field("OCREngine", "2")
-            form.add_field("scale", "true")
+            form.add_field("detectOrientation", "true")
             async with s.post(
                 "https://api.ocr.space/parse/image",
                 data=form,
                 headers={"apikey": OCR_API_KEY},
                 timeout=60
             ) as r:
+                log.info(f"OCR HTTP статус: {r.status}")
                 j = await r.json()
+                log.info(f"OCR ответ: {str(j)[:500]}")
+
         if j.get("IsErroredOnProcessing"):
-            log.error(f"OCR error: {j}")
+            err = j.get("ErrorMessage") or j.get("ErrorDetails")
+            log.error(f"OCR вернул ошибку: {err}")
             return None
-        return j["ParsedResults"][0]["ParsedText"]
+
+        results = j.get("ParsedResults")
+        if not results:
+            log.error(f"OCR без результатов: {j}")
+            return None
+
+        text = results[0].get("ParsedText", "")
+        log.info(f"OCR распознал {len(text)} символов")
+        return text
+
     except Exception as e:
-        log.error(f"OCR exception: {e}")
+        log.error(f"OCR исключение: {e}", exc_info=True)
         return None
 
 
@@ -468,19 +503,38 @@ async def any_message(m: Message):
             data = buf.getvalue()
         except AttributeError:
             data = bytes(buf.read())
+
+        log.info(f"Скачал фото: {len(data)} байт")
+
+        # Сжимаем перед отправкой
+        data = prepare_image(data)
+        log.info(f"После сжатия: {len(data)} байт")
+
         text = await ocr_image(data)
+
         if not text:
-            await m.answer("❌ Не удалось распознать. Проверьте OCR API.")
+            await m.answer(
+                "❌ OCR не смог распознать картинку.\n\n"
+                "Возможные причины:\n"
+                "• Исчерпан лимит бесплатного OCR.space (500/день или 10/10мин)\n"
+                "• Неверный OCR_API_KEY\n"
+                "• Картинка слишком тёмная/сложная\n\n"
+                "Проверь логи на Render — там всё написано."
+            )
             return
+
         matches = parse_block(text, default_league="Общая")
         if not matches:
-            preview = text[:600]
+            preview = text[:1500]
             await m.answer(
-                "⚠️ Не нашёл матчей.\n\n"
-                f"Распознанный текст:\n`{preview}`",
+                "⚠️ OCR распознал текст, но я не нашёл в нём матчей.\n"
+                "Возможно, формат скриншота пока не поддерживается.\n\n"
+                f"Вот что увидел OCR (первые 1500 символов):\n\n"
+                f"`{preview}`",
                 parse_mode="Markdown"
             )
             return
+
         for mt in matches:
             await insert_match(**mt)
         await m.answer(
@@ -508,7 +562,7 @@ async def any_message(m: Message):
         )
 
 
-# ---------- WEB (health-check для Render) ----------
+# ---------- WEB ----------
 async def health(_):
     return web.Response(text="OK")
 
@@ -526,10 +580,8 @@ async def start_web():
 
 # ---------- MAIN ----------
 async def main():
-    # 1. СНАЧАЛА порт — иначе Render убьёт контейнер
     await start_web()
 
-    # 2. Потом БД
     if not DATABASE_URL:
         log.error("=== DATABASE_URL not set! ===")
     else:
@@ -542,10 +594,12 @@ async def main():
                 log.error(f"=== DB INIT FAILED (try {attempt+1}): {e} ===")
                 await asyncio.sleep(5)
 
-    # 3. Потом Telegram polling
     if not BOT_TOKEN:
         log.error("=== BOT_TOKEN not set! ===")
         return
+    if not OCR_API_KEY:
+        log.error("=== OCR_API_KEY not set! ===")
+
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
