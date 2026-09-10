@@ -152,7 +152,6 @@ def parse_block(text, default_league="Общая"):
 
 # ---------- IMAGE PREP ----------
 def prepare_image(image_bytes, max_size=1600):
-    """Сжимаем картинку, чтобы уложиться в лимит OCR.space (1 МБ)."""
     try:
         img = Image.open(io.BytesIO(image_bytes))
         if img.mode != "RGB":
@@ -172,17 +171,14 @@ def prepare_image(image_bytes, max_size=1600):
 # ---------- OCR ----------
 async def ocr_image(image_bytes):
     if not OCR_API_KEY:
-        log.error("OCR_API_KEY не задан в переменных окружения!")
+        log.error("OCR_API_KEY не задан")
         return None
     try:
         log.info(f"OCR: отправляю {len(image_bytes)} байт")
         async with ClientSession() as s:
             form = FormData()
-            form.add_field(
-                "file", image_bytes,
-                filename="img.jpg",
-                content_type="image/jpeg"
-            )
+            form.add_field("file", image_bytes, filename="img.jpg",
+                           content_type="image/jpeg")
             form.add_field("language", "rus")
             form.add_field("isOverlayRequired", "false")
             form.add_field("OCREngine", "2")
@@ -196,21 +192,15 @@ async def ocr_image(image_bytes):
                 log.info(f"OCR HTTP статус: {r.status}")
                 j = await r.json()
                 log.info(f"OCR ответ: {str(j)[:500]}")
-
         if j.get("IsErroredOnProcessing"):
-            err = j.get("ErrorMessage") or j.get("ErrorDetails")
-            log.error(f"OCR вернул ошибку: {err}")
+            log.error(f"OCR ошибка: {j.get('ErrorMessage')}")
             return None
-
         results = j.get("ParsedResults")
         if not results:
-            log.error(f"OCR без результатов: {j}")
             return None
-
         text = results[0].get("ParsedText", "")
         log.info(f"OCR распознал {len(text)} символов")
         return text
-
     except Exception as e:
         log.error(f"OCR исключение: {e}", exc_info=True)
         return None
@@ -339,7 +329,7 @@ async def cmd_start(m: Message):
         "`ЦСКА - Локомотив 4:5 (2:2,1:1,1:2)`\n\n"
         "*Прогноз:*\n"
         "`/predict Москва: Динамо - Спартак 1.85`\n\n"
-        "*Другое:* /leagues /teams /stats /bank",
+        "*Другое:* /leagues /teams /stats /bank /test_fonbet",
         parse_mode="Markdown"
     )
 
@@ -352,6 +342,98 @@ async def cmd_help(m: Message):
 @router.message(Command("ping"))
 async def cmd_ping(m: Message):
     await m.answer("🏓 Pong! Бот живой.")
+
+
+@router.message(Command("test_fonbet"))
+async def cmd_test_fonbet(m: Message):
+    await m.answer("🔍 Проверяю Fonbet API...")
+    try:
+        async with ClientSession() as s:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0 Safari/537.36",
+                "Accept": "*/*",
+                "Referer": "https://www.fon.bet/",
+            }
+
+            r0 = await s.get("https://www.fon.bet/", headers=headers, timeout=15)
+            html = await r0.text()
+            log.info(f"Fonbet main: status={r0.status}, len={len(html)}")
+
+            api_domain = None
+            for candidate in ["line01", "line31", "line52", "line53", "line54"]:
+                if f"{candidate}.bkfon-resources.com" in html:
+                    api_domain = f"{candidate}.bkfon-resources.com"
+                    break
+            if not api_domain:
+                api_domain = "line52.bkfon-resources.com"
+
+            log.info(f"Fonbet API domain: {api_domain}")
+
+            url = (
+                f"https://{api_domain}/events/list"
+                f"?lang=ru&version=7175598316&scopeMarket=1600"
+            )
+            r1 = await s.get(url, headers=headers, timeout=20)
+            log.info(f"Fonbet API status: {r1.status}")
+
+            text_preview = (await r1.text())[:500]
+            log.info(f"Fonbet API preview: {text_preview}")
+
+            if r1.status != 200:
+                await m.answer(
+                    f"❌ Fonbet API статус: {r1.status}\n\n"
+                    f"Превью:\n`{text_preview}`",
+                    parse_mode="Markdown"
+                )
+                return
+
+            try:
+                data = await r1.json()
+            except Exception as e:
+                await m.answer(
+                    f"❌ Ответ не JSON: {e}\n\n"
+                    f"Превью:\n`{text_preview}`",
+                    parse_mode="Markdown"
+                )
+                return
+
+            events = data.get("events", []) or []
+            sports = data.get("sports", []) or []
+
+            cyber_events = []
+            for e in events:
+                sid = str(e.get("sportId", ""))
+                if sid in ("2", "5", "29"):
+                    cyber_events.append(e)
+
+            report = (
+                f"✅ Fonbet API доступен!\n\n"
+                f"🌐 Домен: `{api_domain}`\n"
+                f"📊 Всего событий: *{len(events)}*\n"
+                f"🎮 Киберспорт: *{len(cyber_events)}*\n"
+                f"🏆 Видов спорта: *{len(sports)}*\n\n"
+            )
+
+            if cyber_events:
+                report += "*Первые 5 кибер-событий:*\n"
+                for e in cyber_events[:5]:
+                    t1 = e.get("team1", "?")
+                    t2 = e.get("team2", "?")
+                    report += f"• {t1} vs {t2}\n"
+            else:
+                report += (
+                    "Киберспорт не найден по sportId.\n"
+                    "Пришли JSON preview."
+                )
+                report += f"\n\nJSON preview:\n`{str(data)[:1200]}`"
+
+            await m.answer(report, parse_mode="Markdown")
+
+    except Exception as e:
+        log.error(f"test_fonbet error: {e}", exc_info=True)
+        await m.answer(f"❌ Ошибка: `{e}`", parse_mode="Markdown")
 
 
 @router.message(Command("leagues"))
@@ -412,9 +494,7 @@ async def cmd_bank(m: Message):
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
         cur = await get_setting("bank", "10000")
-        await m.answer(
-            f"Текущий банк: {cur} ₽\nИзменить: /bank 5000"
-        )
+        await m.answer(f"Текущий банк: {cur} ₽\nИзменить: /bank 5000")
         return
     try:
         v = float(parts[1].replace(",", ".").replace(" ", ""))
@@ -486,9 +566,7 @@ async def cmd_predict(m: Message):
             f"📈 Value: {p['value']*100:+.1f}% при коэф. {odds}",
         ]
     else:
-        lines.append(
-            f"❌ Value = {p['value']*100:+.1f}%. Пропуск."
-        )
+        lines.append(f"❌ Value = {p['value']*100:+.1f}%. Пропуск.")
     await m.answer("\n".join(lines), parse_mode="Markdown")
 
 
@@ -505,42 +583,27 @@ async def any_message(m: Message):
             data = bytes(buf.read())
 
         log.info(f"Скачал фото: {len(data)} байт")
-
-        # Сжимаем перед отправкой
         data = prepare_image(data)
         log.info(f"После сжатия: {len(data)} байт")
 
         text = await ocr_image(data)
-
         if not text:
-            await m.answer(
-                "❌ OCR не смог распознать картинку.\n\n"
-                "Возможные причины:\n"
-                "• Исчерпан лимит бесплатного OCR.space (500/день или 10/10мин)\n"
-                "• Неверный OCR_API_KEY\n"
-                "• Картинка слишком тёмная/сложная\n\n"
-                "Проверь логи на Render — там всё написано."
-            )
+            await m.answer("❌ OCR не смог распознать картинку.")
             return
 
         matches = parse_block(text, default_league="Общая")
         if not matches:
             preview = text[:1500]
             await m.answer(
-                "⚠️ OCR распознал текст, но я не нашёл в нём матчей.\n"
-                "Возможно, формат скриншота пока не поддерживается.\n\n"
-                f"Вот что увидел OCR (первые 1500 символов):\n\n"
-                f"`{preview}`",
+                "⚠️ OCR распознал текст, но я не нашёл в нём матчей.\n\n"
+                f"Вот что увидел OCR:\n\n`{preview}`",
                 parse_mode="Markdown"
             )
             return
 
         for mt in matches:
             await insert_match(**mt)
-        await m.answer(
-            f"✅ Добавлено {len(matches)} матчей.\n"
-            f"Проверь: /leagues"
-        )
+        await m.answer(f"✅ Добавлено {len(matches)} матчей.")
         return
 
     if m.text:
@@ -603,6 +666,13 @@ async def main():
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        log.info("=== WEBHOOK CLEARED ===")
+    except Exception as e:
+        log.warning(f"delete_webhook failed: {e}")
+
     log.info("=== BOT POLLING ===")
     await dp.start_polling(bot)
 
