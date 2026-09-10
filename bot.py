@@ -42,7 +42,6 @@ def over_prob(lam, threshold):
 
 # ---------- DATABASE ----------
 async def create_pool_with_retry(max_attempts=100, delay=10):
-    """Создаёт пул. Пробует много раз с паузами, не падает."""
     global pool
     if not DATABASE_URL:
         log.error("=== DATABASE_URL not set! ===")
@@ -55,8 +54,7 @@ async def create_pool_with_retry(max_attempts=100, delay=10):
                 max_size=5,
                 timeout=60,
                 command_timeout=60,
-                statement_cache_size=0,
-                prepared_statement_cache_size=0
+                statement_cache_size=0
             )
             async with pool.acquire() as c:
                 await c.execute("SELECT 1")
@@ -111,7 +109,6 @@ async def init_db():
 
 
 async def ensure_pool():
-    """Проверяет, что пул жив. Если нет — пытается переподключиться."""
     global pool
     if pool is not None:
         try:
@@ -125,7 +122,6 @@ async def ensure_pool():
             except Exception:
                 pass
             pool = None
-    # Переподключаемся
     await create_pool_with_retry(max_attempts=3, delay=3)
     return pool is not None
 
@@ -231,9 +227,10 @@ def parse_block(text, default_league="Общая", default_date=None):
         if not m:
             continue
 
-        t1 = m.group(1).strip()
-        t2 = m.group(2).strip()
-        s1, s2 = int(m.group(3)), int(m.group(4))
+_KEY        t1 = m.group(1 не).strip()
+        t зада2 = m.group(2).stripн()
+        s1, s2")
+ = int(m.group(3)), int(m       .group(4))
         periods = None
         if m.group(5):
             pairs = re.findall(r'(\d+)\s*[:]\s*(\d+)', m.group(5))
@@ -273,8 +270,7 @@ def prepare_image(image_bytes, max_size=1600):
 # ---------- OCR ----------
 async def ocr_image(image_bytes):
     if not OCR_API_KEY:
-        log.error("OCR_API_KEY не задан")
-        return None
+        log.error("OCR_API return None
     try:
         log.info(f"OCR: отправляю {len(image_bytes)} байт")
         async with ClientSession() as s:
@@ -437,7 +433,7 @@ async def cmd_start(m: Message):
         "*Прогноз:* `/predict Лига: Т1 - Т2 1.85`\n"
         "*Статистика:* /leagues /stats /by_date\n"
         "*Банк:* /bank 10000\n"
-        "*Управление:* /delete_all",
+        "*Управление:* /delete_all /db",
         parse_mode="Markdown"
     )
 
@@ -457,7 +453,10 @@ async def cmd_db(m: Message):
     if pool is None:
         await m.answer("❌ Пул не создан. Пробую переподключиться...")
         ok = await ensure_pool()
-        await m.answer("✅ Переподключился." if ok else "❌ Не удалось.")
+        if ok:
+            await m.answer("✅ Переподключился.")
+        else:
+            await m.answer("❌ Не удалось. Смотри логи Render.")
         return
     try:
         async with pool.acquire() as c:
@@ -763,7 +762,6 @@ async def start_web():
 async def main():
     await start_web()
 
-    # Ждём БД в фоне, не блокируем polling
     asyncio.create_task(_db_bootstrap())
 
     if not BOT_TOKEN:
@@ -787,7 +785,6 @@ async def main():
 
 
 async def _db_bootstrap():
-    """Фоновое подключение к БД. Не блокирует запуск бота."""
     await create_pool_with_retry(max_attempts=100, delay=15)
     if pool is not None:
         await init_db()
